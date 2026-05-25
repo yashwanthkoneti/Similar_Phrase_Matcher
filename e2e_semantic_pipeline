@@ -1,0 +1,811 @@
+"""
+===========================================================
+E2E SEMANTIC PHRASE DISCOVERY PIPELINE
+===========================================================
+
+GOAL
+-----
+Discover latent operational themes from event sequences.
+
+KEY DESIGN
+-----------
+1. Entire case represented as ordered text events
+2. Sliding windows ONLY used for phrase candidates
+3. Avoid adjacent-window leakage
+4. Siamese contrastive learning
+5. Mean pooled trainable embeddings
+6. DBSCAN clustering
+7. Semantic retrieval
+8. Multi-theme case detection
+
+-----------------------------------------------------------
+INSTALL
+-----------------------------------------------------------
+
+pip install pandas numpy torch scikit-learn tqdm
+
+-----------------------------------------------------------
+RUN
+-----------------------------------------------------------
+
+python e2e_semantic_pipeline.py
+"""
+
+# ============================================================
+# IMPORTS
+# ============================================================
+
+import re
+import random
+
+from collections import Counter, defaultdict
+from itertools import combinations
+
+import numpy as np
+import pandas as pd
+
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from torch.utils.data import Dataset, DataLoader
+
+from sklearn.cluster import DBSCAN
+from sklearn.metrics.pairwise import cosine_similarity
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+SEED = 42
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+WINDOW_SIZES = [3,4,5]
+
+MIN_WINDOW_DISTANCE = 5
+
+MIN_TOKEN_FREQ = 1
+
+MAX_LEN = 12
+
+EMB_DIM = 128
+
+BATCH_SIZE = 128
+
+EPOCHS = 5
+
+LR = 1e-3
+
+MARGIN = 0.3
+
+DBSCAN_EPS = 0.25
+
+TOPK = 5
+
+# ============================================================
+# SAMPLE CASES
+# Replace this with real data
+# ============================================================
+
+cases = [
+
+"""
+EVENT_1
+ACTION: customer account opened
+NARRATIVE: onboarding completed successfully
+RISKCODE: KYC
+STATUS: OPEN
+
+EVENT_2
+ACTION: rapid movement of funds observed
+NARRATIVE: large incoming wire transfers
+RISKCODE: WIRE
+STATUS: OPEN
+
+EVENT_3
+ACTION: outgoing international wires initiated
+NARRATIVE: high velocity transfer activity
+RISKCODE: WIRE
+STATUS: OPEN
+
+EVENT_4
+ACTION: customer unreachable
+NARRATIVE: account closure initiated
+RISKCODE: EXIT
+STATUS: CLOSED
+""",
+
+"""
+EVENT_1
+ACTION: account recently created
+NARRATIVE: new customer profile detected
+RISKCODE: KYC
+STATUS: OPEN
+
+EVENT_2
+ACTION: multiple outgoing wire transfers
+NARRATIVE: rapid transfer behavior observed
+RISKCODE: WIRE
+STATUS: OPEN
+
+EVENT_3
+ACTION: repeated international transfers
+NARRATIVE: suspicious wire movement
+RISKCODE: WIRE
+STATUS: OPEN
+""",
+
+"""
+EVENT_1
+ACTION: identity mismatch detected
+NARRATIVE: inconsistent customer information
+RISKCODE: KYC
+STATUS: OPEN
+
+EVENT_2
+ACTION: synthetic identity indicators observed
+NARRATIVE: document verification failure
+RISKCODE: KYC
+STATUS: OPEN
+""",
+
+"""
+EVENT_1
+ACTION: structured cash deposits observed
+NARRATIVE: repeated cash funding activity
+RISKCODE: CASH
+STATUS: OPEN
+
+EVENT_2
+ACTION: immediate withdrawals detected
+NARRATIVE: possible funnel account activity
+RISKCODE: CASH
+STATUS: OPEN
+"""
+]
+
+# ============================================================
+# NORMALIZATION
+# ============================================================
+
+def normalize_text(text):
+
+    text = text.lower()
+
+    text = re.sub(r'\d+', ' NUM_TOKEN ', text)
+
+    text = re.sub(r'\s+', ' ', text)
+
+    return text.strip()
+
+normalized_cases = [
+    normalize_text(x)
+    for x in cases
+]
+
+print("\n================ NORMALIZED CASES ================\n")
+
+for c in normalized_cases:
+    print(c[:300])
+    print()
+
+# ============================================================
+# VOCAB BUILDING
+# ============================================================
+
+counter = Counter()
+
+for text in normalized_cases:
+
+    counter.update(text.split())
+
+vocab = {
+
+    "<PAD>": 0,
+
+    "<UNK>": 1
+}
+
+idx = 2
+
+for token, freq in counter.items():
+
+    if freq >= MIN_TOKEN_FREQ:
+
+        vocab[token] = idx
+
+        idx += 1
+
+print("\nVOCAB SIZE:", len(vocab))
+
+# ============================================================
+# SLIDING WINDOW GENERATION
+# IMPORTANT:
+# Windows are ONLY phrase candidates
+# ============================================================
+
+all_windows = []
+
+window_id = 0
+
+def generate_windows(tokens):
+
+    global window_id
+
+    windows = []
+
+    for w in WINDOW_SIZES:
+
+        for i in range(len(tokens)-w+1):
+
+            phrase = " ".join(tokens[i:i+w])
+
+            windows.append({
+
+                "window_id": window_id,
+
+                "start_idx": i,
+
+                "end_idx": i+w,
+
+                "phrase": phrase
+            })
+
+            window_id += 1
+
+    return windows
+
+# ------------------------------------------------------------
+# CREATE WINDOWS
+# ------------------------------------------------------------
+
+for case_idx, text in enumerate(normalized_cases):
+
+    tokens = text.split()
+
+    windows = generate_windows(tokens)
+
+    for w in windows:
+
+        w["case_id"] = case_idx
+
+        all_windows.append(w)
+
+windows_df = pd.DataFrame(all_windows)
+
+print("\nTOTAL WINDOWS:", len(windows_df))
+
+# ============================================================
+# DEDUPLICATE PHRASES
+# ============================================================
+
+phrase_freq = Counter(
+    windows_df["phrase"]
+)
+
+unique_phrases = list(
+    phrase_freq.keys()
+)
+
+print("UNIQUE PHRASES:", len(unique_phrases))
+
+# ============================================================
+# HELPER
+# ============================================================
+
+def token_overlap(p1, p2):
+
+    s1 = set(p1.split())
+    s2 = set(p2.split())
+
+    return len(s1 & s2)
+
+# ============================================================
+# POSITIVE PAIR GENERATION
+# IMPORTANT:
+# Avoid adjacent-window leakage
+# ============================================================
+
+positive_pairs = []
+
+# ------------------------------------------------------------
+# SAME CASE DISTANT RECURRENCE
+# ------------------------------------------------------------
+
+for case_id in windows_df["case_id"].unique():
+
+    case_windows = windows_df[
+        windows_df["case_id"] == case_id
+    ].to_dict("records")
+
+    for i in range(len(case_windows)):
+
+        for j in range(i+1, len(case_windows)):
+
+            w1 = case_windows[i]
+            w2 = case_windows[j]
+
+            # ----------------------------------------
+            # CRITICAL FIX
+            # ----------------------------------------
+
+            if abs(
+                w1["start_idx"] - w2["start_idx"]
+            ) < MIN_WINDOW_DISTANCE:
+
+                continue
+
+            overlap = token_overlap(
+                w1["phrase"],
+                w2["phrase"]
+            )
+
+            # weak semantic signal
+            if overlap >= 1:
+
+                positive_pairs.append((
+                    w1["phrase"],
+                    w2["phrase"],
+                    1
+                ))
+
+print("\nPOSITIVE PAIRS:", len(positive_pairs))
+
+# ============================================================
+# NEGATIVE PAIRS
+# ============================================================
+
+negative_pairs = []
+
+for _ in range(len(positive_pairs)):
+
+    r1 = windows_df.sample(1).iloc[0]
+    r2 = windows_df.sample(1).iloc[0]
+
+    if r1["case_id"] == r2["case_id"]:
+        continue
+
+    overlap = token_overlap(
+        r1["phrase"],
+        r2["phrase"]
+    )
+
+    if overlap == 0:
+
+        negative_pairs.append((
+            r1["phrase"],
+            r2["phrase"],
+            0
+        ))
+
+print("NEGATIVE PAIRS:", len(negative_pairs))
+
+pairs = positive_pairs + negative_pairs
+
+random.shuffle(pairs)
+
+# ============================================================
+# DATASET
+# ============================================================
+
+class SiameseDataset(Dataset):
+
+    def __init__(self, pairs):
+
+        self.pairs = pairs
+
+    def encode(self, text):
+
+        ids = [
+
+            vocab.get(
+                t,
+                vocab["<UNK>"]
+            )
+
+            for t in text.split()
+        ]
+
+        ids = ids[:MAX_LEN]
+
+        while len(ids) < MAX_LEN:
+
+            ids.append(0)
+
+        return torch.tensor(ids)
+
+    def __len__(self):
+
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+
+        p1, p2, label = self.pairs[idx]
+
+        return {
+
+            "x1": self.encode(p1),
+
+            "x2": self.encode(p2),
+
+            "label": torch.tensor(label).float()
+        }
+
+dataset = SiameseDataset(pairs)
+
+loader = DataLoader(
+
+    dataset,
+
+    batch_size=BATCH_SIZE,
+
+    shuffle=True
+)
+
+# ============================================================
+# PHRASE ENCODER
+# ============================================================
+
+class PhraseEncoder(nn.Module):
+
+    def __init__(self, vocab_size, emb_dim):
+
+        super().__init__()
+
+        self.embedding = nn.Embedding(
+
+            vocab_size,
+
+            emb_dim,
+
+            padding_idx=0
+        )
+
+    def forward(self, input_ids):
+
+        emb = self.embedding(input_ids)
+
+        mask = (input_ids != 0).float()
+
+        emb = emb * mask.unsqueeze(-1)
+
+        pooled = emb.sum(1) / (
+            mask.sum(1).unsqueeze(-1) + 1e-8
+        )
+
+        return F.normalize(
+            pooled,
+            p=2,
+            dim=1
+        )
+
+# ============================================================
+# SIAMESE MODEL
+# ============================================================
+
+class SiameseModel(nn.Module):
+
+    def __init__(self, encoder):
+
+        super().__init__()
+
+        self.encoder = encoder
+
+    def forward(self, x1, x2):
+
+        z1 = self.encoder(x1)
+
+        z2 = self.encoder(x2)
+
+        return z1, z2
+
+# ============================================================
+# CONTRASTIVE LOSS
+# ============================================================
+
+class ContrastiveLoss(nn.Module):
+
+    def __init__(self, margin=0.3):
+
+        super().__init__()
+
+        self.margin = margin
+
+    def forward(self, z1, z2, labels):
+
+        cosine = F.cosine_similarity(
+            z1,
+            z2
+        )
+
+        pos_loss = labels * (
+            1 - cosine
+        )
+
+        neg_loss = (
+            1-labels
+        ) * F.relu(
+            cosine - self.margin
+        )
+
+        return (
+            pos_loss + neg_loss
+        ).mean()
+
+# ============================================================
+# TRAINING
+# ============================================================
+
+encoder = PhraseEncoder(
+
+    vocab_size=len(vocab),
+
+    emb_dim=EMB_DIM
+)
+
+model = SiameseModel(
+    encoder
+).to(DEVICE)
+
+criterion = ContrastiveLoss(
+    margin=MARGIN
+)
+
+optimizer = torch.optim.Adam(
+
+    model.parameters(),
+
+    lr=LR
+)
+
+print("\n================ TRAINING ================\n")
+
+for epoch in range(EPOCHS):
+
+    model.train()
+
+    total_loss = 0
+
+    for batch in loader:
+
+        x1 = batch["x1"].to(DEVICE)
+
+        x2 = batch["x2"].to(DEVICE)
+
+        y = batch["label"].to(DEVICE)
+
+        z1, z2 = model(x1, x2)
+
+        loss = criterion(
+            z1,
+            z2,
+            y
+        )
+
+        optimizer.zero_grad()
+
+        loss.backward()
+
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    print(
+        f"Epoch {epoch+1} "
+        f"Loss: {total_loss:.4f}"
+    )
+
+# ============================================================
+# EMBEDDING GENERATION
+# ============================================================
+
+print("\n================ GENERATING EMBEDDINGS ================\n")
+
+def encode_phrase(text):
+
+    ids = [
+
+        vocab.get(
+            t,
+            vocab["<UNK>"]
+        )
+
+        for t in text.split()
+    ]
+
+    ids = ids[:MAX_LEN]
+
+    while len(ids) < MAX_LEN:
+
+        ids.append(0)
+
+    return torch.tensor(ids).unsqueeze(0)
+
+model.eval()
+
+phrase_embeddings = []
+
+with torch.no_grad():
+
+    for phrase in tqdm(unique_phrases):
+
+        ids = encode_phrase(
+            phrase
+        ).to(DEVICE)
+
+        emb = model.encoder(ids)
+
+        phrase_embeddings.append(
+            emb.squeeze(0).cpu().numpy()
+        )
+
+phrase_embeddings = np.array(
+    phrase_embeddings
+)
+
+print(
+    "EMBEDDING SHAPE:",
+    phrase_embeddings.shape
+)
+
+# ============================================================
+# CLUSTERING
+# ============================================================
+
+print("\n================ CLUSTERING ================\n")
+
+clusterer = DBSCAN(
+
+    eps=DBSCAN_EPS,
+
+    min_samples=2,
+
+    metric='cosine'
+)
+
+cluster_labels = clusterer.fit_predict(
+    phrase_embeddings
+)
+
+cluster_map = defaultdict(list)
+
+for phrase, label in zip(
+
+    unique_phrases,
+
+    cluster_labels
+):
+
+    cluster_map[label].append(
+        phrase
+    )
+
+# ============================================================
+# DISCOVERED THEMES
+# ============================================================
+
+print("\n================ DISCOVERED THEMES ================\n")
+
+for cluster_id, phrases in cluster_map.items():
+
+    if cluster_id == -1:
+        continue
+
+    print(f"\nCLUSTER {cluster_id}")
+
+    print("-" * 50)
+
+    for p in phrases[:10]:
+
+        print(p)
+
+# ============================================================
+# SEMANTIC RETRIEVAL
+# ============================================================
+
+print("\n================ RETRIEVAL ================\n")
+
+def retrieve(query, topk=5):
+
+    model.eval()
+
+    with torch.no_grad():
+
+        ids = encode_phrase(
+            query
+        ).to(DEVICE)
+
+        query_emb = model.encoder(ids)
+
+        query_emb = query_emb.cpu().numpy()
+
+    sims = cosine_similarity(
+
+        query_emb,
+
+        phrase_embeddings
+    )[0]
+
+    top_idx = sims.argsort()[-topk:][::-1]
+
+    results = []
+
+    for idx in top_idx:
+
+        results.append({
+
+            "phrase": unique_phrases[idx],
+
+            "score": round(
+                float(sims[idx]),
+                4
+            )
+        })
+
+    return results
+
+query = "rapid movement funds"
+
+results = retrieve(query)
+
+print("\nQUERY:", query)
+
+for r in results:
+
+    print(r)
+
+# ============================================================
+# MULTI-THEME DETECTION
+# ============================================================
+
+print("\n================ MULTI-THEME DETECTION ================\n")
+
+phrase_to_cluster = {
+
+    p: c
+
+    for p, c in zip(
+        unique_phrases,
+        cluster_labels
+    )
+}
+
+for case_id, text in enumerate(normalized_cases):
+
+    tokens = text.split()
+
+    windows = generate_windows(tokens)
+
+    clusters = []
+
+    for w in windows:
+
+        phrase = w["phrase"]
+
+        if phrase in phrase_to_cluster:
+
+            c = phrase_to_cluster[phrase]
+
+            if c != -1:
+
+                clusters.append(c)
+
+    counts = Counter(clusters)
+
+    print(f"\nCASE {case_id}")
+
+    for cluster_id, count in counts.items():
+
+        print(
+            f"Theme Cluster {cluster_id} "
+            f"-> {count} phrases"
+        )
+
+print("\nDONE.")
