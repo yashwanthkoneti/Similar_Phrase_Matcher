@@ -1,0 +1,683 @@
+"""
+===========================================================
+LIGHTWEIGHT SEMANTIC PHRASE DISCOVERY PIPELINE
+===========================================================
+
+GOAL
+-----
+Scalable phrase discovery from long sequential narratives.
+
+IMPORTANT DESIGN CHANGES
+------------------------
+1. NO pair explosion
+2. NO all-vs-all contrastive learning
+3. NO domain hardcoding
+4. NO manual keywords
+5. Automatically discovers high-signal terms
+6. Works on small machines
+7. Handles long narratives
+
+CORE IDEA
+---------
+Long narratives
+    ->
+event segmentation
+    ->
+localized windows
+    ->
+automatic signal term discovery
+    ->
+phrase extraction
+    ->
+train lightweight embeddings
+    ->
+cluster semantic phrases
+
+-----------------------------------------------------------
+INSTALL
+-----------------------------------------------------------
+
+pip install pandas numpy torch scikit-learn tqdm
+
+-----------------------------------------------------------
+RUN
+-----------------------------------------------------------
+
+python lightweight_semantic_pipeline.py
+"""
+
+# ============================================================
+# IMPORTS
+# ============================================================
+
+import re
+import random
+
+from collections import Counter, defaultdict
+
+import numpy as np
+import pandas as pd
+
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from sklearn.cluster import DBSCAN
+from sklearn.metrics.pairwise import cosine_similarity
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+SEED = 42
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+WINDOW_SIZES = [3,4,5]
+
+MIN_TOKEN_FREQ = 2
+
+MIN_SIGNAL_TOKEN_FREQ = 3
+
+TOP_SIGNAL_TERMS = 100
+
+MAX_LEN = 8
+
+EMB_DIM = 64
+
+EPOCHS = 20
+
+LR = 1e-3
+
+DBSCAN_EPS = 0.25
+
+# ============================================================
+# SAMPLE LONG NARRATIVES
+# Replace with real case_text from pandas dataframe
+# ============================================================
+
+documents = [
+
+"""
+EVENT_1
+ACTION: customer account opened
+NARRATIVE: onboarding completed successfully
+STATUS: OPEN
+
+EVENT_2
+ACTION: rapid movement of funds observed
+NARRATIVE: multiple outgoing transfers initiated
+STATUS: OPEN
+
+EVENT_3
+ACTION: repeated outgoing wire activity
+NARRATIVE: high velocity movement detected
+STATUS: OPEN
+""",
+
+"""
+EVENT_1
+ACTION: identity verification failed
+NARRATIVE: inconsistent customer information observed
+STATUS: OPEN
+
+EVENT_2
+ACTION: repeated document mismatch detected
+NARRATIVE: synthetic profile behavior identified
+STATUS: OPEN
+""",
+
+"""
+EVENT_1
+ACTION: repeated cash deposits observed
+NARRATIVE: structured funding activity detected
+STATUS: OPEN
+
+EVENT_2
+ACTION: immediate withdrawals initiated
+NARRATIVE: funnel movement behavior identified
+STATUS: OPEN
+"""
+]
+
+# ============================================================
+# NORMALIZATION
+# ============================================================
+
+def normalize_text(text):
+
+    text = text.lower()
+
+    text = re.sub(r'\d+', ' NUM_TOKEN ', text)
+
+    text = re.sub(r'\s+', ' ', text)
+
+    return text.strip()
+
+documents = [
+    normalize_text(x)
+    for x in documents
+]
+
+# ============================================================
+# TOKENIZATION
+# ============================================================
+
+tokenized_docs = [
+    doc.split()
+    for doc in documents
+]
+
+# ============================================================
+# VOCAB BUILDING
+# ============================================================
+
+counter = Counter()
+
+for tokens in tokenized_docs:
+
+    counter.update(tokens)
+
+vocab = {
+
+    "<PAD>": 0,
+
+    "<UNK>": 1
+}
+
+idx = 2
+
+for token, freq in counter.items():
+
+    if freq >= MIN_TOKEN_FREQ:
+
+        vocab[token] = idx
+
+        idx += 1
+
+print("\nVOCAB SIZE:", len(vocab))
+
+# ============================================================
+# AUTOMATIC SIGNAL TERM DISCOVERY
+# ============================================================
+
+"""
+NO MANUAL DOMAIN WORDS.
+
+We automatically discover:
+    - informative
+    - recurring
+    - non-generic terms
+"""
+
+# ------------------------------------------------------------
+# SIMPLE STOPWORDS
+# ------------------------------------------------------------
+
+STOPWORDS = {
+
+    "the",
+    "a",
+    "an",
+    "of",
+    "to",
+    "and",
+    "in",
+    "for",
+    "on",
+    "with",
+    "is",
+    "was",
+    "are",
+    "be",
+    "event_num_token",
+    "event",
+    "action",
+    "narrative",
+    "status"
+}
+
+# ------------------------------------------------------------
+# DOCUMENT FREQUENCY
+# ------------------------------------------------------------
+
+doc_freq = Counter()
+
+for tokens in tokenized_docs:
+
+    unique_tokens = set(tokens)
+
+    doc_freq.update(unique_tokens)
+
+# ------------------------------------------------------------
+# SIGNAL TERM SCORING
+# ------------------------------------------------------------
+
+signal_scores = {}
+
+N_DOCS = len(tokenized_docs)
+
+for token, freq in counter.items():
+
+    if token in STOPWORDS:
+        continue
+
+    if len(token) <= 2:
+        continue
+
+    if freq < MIN_SIGNAL_TOKEN_FREQ:
+        continue
+
+    dfreq = doc_freq[token]
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # frequent but not universal terms
+    # --------------------------------------------------------
+
+    score = freq * np.log(
+        N_DOCS / (1 + dfreq)
+    )
+
+    signal_scores[token] = score
+
+# ------------------------------------------------------------
+# TOP SIGNAL TERMS
+# ------------------------------------------------------------
+
+signal_terms = set(
+
+    sorted(
+
+        signal_scores,
+
+        key=signal_scores.get,
+
+        reverse=True
+
+    )[:TOP_SIGNAL_TERMS]
+)
+
+print("\nDISCOVERED SIGNAL TERMS:\n")
+
+print(signal_terms)
+
+# ============================================================
+# EVENT SPLITTING
+# ============================================================
+
+def split_events(doc):
+
+    parts = re.split(
+        r'event_num_token',
+        doc
+    )
+
+    return [
+        p.strip()
+        for p in parts
+        if p.strip()
+    ]
+
+# ============================================================
+# LOCAL WINDOW GENERATION
+# IMPORTANT:
+# ONLY WITHIN EVENTS
+# ============================================================
+
+phrase_counter = Counter()
+
+all_phrases = []
+
+def generate_windows(tokens):
+
+    phrases = []
+
+    for w in WINDOW_SIZES:
+
+        for i in range(len(tokens)-w+1):
+
+            phrase_tokens = tokens[i:i+w]
+
+            # ------------------------------------------------
+            # IMPORTANT:
+            # retain only phrases containing
+            # discovered signal terms
+            # ------------------------------------------------
+
+            if not any(
+                t in signal_terms
+                for t in phrase_tokens
+            ):
+                continue
+
+            phrase = " ".join(phrase_tokens)
+
+            phrases.append(phrase)
+
+    return phrases
+
+# ------------------------------------------------------------
+# EXTRACT PHRASES
+# ------------------------------------------------------------
+
+for doc in documents:
+
+    events = split_events(doc)
+
+    for event in events:
+
+        tokens = event.split()
+
+        phrases = generate_windows(tokens)
+
+        phrase_counter.update(phrases)
+
+# ------------------------------------------------------------
+# DEDUPLICATED PHRASES
+# ------------------------------------------------------------
+
+unique_phrases = [
+
+    p for p, freq in phrase_counter.items()
+
+    if freq >= 1
+]
+
+print("\nTOTAL UNIQUE PHRASES:", len(unique_phrases))
+
+# ============================================================
+# LIGHTWEIGHT TRAINING DATA
+# ============================================================
+
+"""
+NO pair explosion.
+
+We use:
+    phrase -> neighboring phrase learning
+"""
+
+training_pairs = []
+
+for doc in documents:
+
+    events = split_events(doc)
+
+    for event in events:
+
+        tokens = event.split()
+
+        phrases = generate_windows(tokens)
+
+        # local neighboring phrases
+        for i in range(len(phrases)-1):
+
+            p1 = phrases[i]
+            p2 = phrases[i+1]
+
+            training_pairs.append(
+                (p1, p2)
+            )
+
+print("\nTRAINING PAIRS:", len(training_pairs))
+
+# ============================================================
+# PHRASE ENCODER
+# ============================================================
+
+class PhraseEncoder(nn.Module):
+
+    def __init__(self, vocab_size, emb_dim):
+
+        super().__init__()
+
+        self.embedding = nn.Embedding(
+
+            vocab_size,
+
+            emb_dim,
+
+            padding_idx=0
+        )
+
+    def encode_phrase(self, phrase):
+
+        ids = [
+
+            vocab.get(
+                t,
+                vocab["<UNK>"]
+            )
+
+            for t in phrase.split()
+        ]
+
+        ids = ids[:MAX_LEN]
+
+        while len(ids) < MAX_LEN:
+            ids.append(0)
+
+        return torch.tensor(ids)
+
+    def forward(self, input_ids):
+
+        emb = self.embedding(input_ids)
+
+        mask = (input_ids != 0).float()
+
+        emb = emb * mask.unsqueeze(-1)
+
+        pooled = emb.sum(1) / (
+            mask.sum(1).unsqueeze(-1) + 1e-8
+        )
+
+        return F.normalize(
+            pooled,
+            p=2,
+            dim=1
+        )
+
+encoder = PhraseEncoder(
+    len(vocab),
+    EMB_DIM
+).to(DEVICE)
+
+optimizer = torch.optim.Adam(
+    encoder.parameters(),
+    lr=LR
+)
+
+# ============================================================
+# LIGHTWEIGHT TRAINING
+# ============================================================
+
+"""
+Neighboring phrases should be similar.
+"""
+
+print("\n================ TRAINING ================\n")
+
+for epoch in range(EPOCHS):
+
+    total_loss = 0
+
+    random.shuffle(training_pairs)
+
+    for p1, p2 in training_pairs:
+
+        ids1 = encoder.encode_phrase(
+            p1
+        ).unsqueeze(0).to(DEVICE)
+
+        ids2 = encoder.encode_phrase(
+            p2
+        ).unsqueeze(0).to(DEVICE)
+
+        z1 = encoder(ids1)
+
+        z2 = encoder(ids2)
+
+        cosine = F.cosine_similarity(
+            z1,
+            z2
+        )
+
+        loss = (1 - cosine).mean()
+
+        optimizer.zero_grad()
+
+        loss.backward()
+
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    print(
+        f"Epoch {epoch+1} "
+        f"Loss: {total_loss:.4f}"
+    )
+
+# ============================================================
+# EMBEDDING GENERATION
+# ============================================================
+
+print("\n================ GENERATING EMBEDDINGS ================\n")
+
+phrase_embeddings = []
+
+encoder.eval()
+
+with torch.no_grad():
+
+    for phrase in tqdm(unique_phrases):
+
+        ids = encoder.encode_phrase(
+            phrase
+        ).unsqueeze(0).to(DEVICE)
+
+        emb = encoder(ids)
+
+        phrase_embeddings.append(
+            emb.squeeze(0).cpu().numpy()
+        )
+
+phrase_embeddings = np.array(
+    phrase_embeddings
+)
+
+print(
+    "EMBEDDING SHAPE:",
+    phrase_embeddings.shape
+)
+
+# ============================================================
+# CLUSTERING
+# ============================================================
+
+print("\n================ CLUSTERING ================\n")
+
+clusterer = DBSCAN(
+
+    eps=DBSCAN_EPS,
+
+    min_samples=2,
+
+    metric='cosine'
+)
+
+cluster_labels = clusterer.fit_predict(
+    phrase_embeddings
+)
+
+cluster_map = defaultdict(list)
+
+for phrase, label in zip(
+
+    unique_phrases,
+
+    cluster_labels
+):
+
+    cluster_map[label].append(
+        phrase
+    )
+
+# ============================================================
+# DISCOVERED THEMES
+# ============================================================
+
+print("\n================ DISCOVERED SEMANTIC THEMES ================\n")
+
+for cluster_id, phrases in cluster_map.items():
+
+    if cluster_id == -1:
+        continue
+
+    print(f"\nCLUSTER {cluster_id}")
+
+    print("-" * 50)
+
+    for p in phrases[:10]:
+
+        print(p)
+
+# ============================================================
+# SEMANTIC RETRIEVAL
+# ============================================================
+
+print("\n================ RETRIEVAL ================\n")
+
+def retrieve(query, topk=5):
+
+    ids = encoder.encode_phrase(
+        query
+    ).unsqueeze(0).to(DEVICE)
+
+    with torch.no_grad():
+
+        query_emb = encoder(ids)
+
+    query_emb = query_emb.cpu().numpy()
+
+    sims = cosine_similarity(
+
+        query_emb,
+
+        phrase_embeddings
+    )[0]
+
+    top_idx = sims.argsort()[-topk:][::-1]
+
+    results = []
+
+    for idx in top_idx:
+
+        results.append({
+
+            "phrase": unique_phrases[idx],
+
+            "score": round(
+                float(sims[idx]),
+                4
+            )
+        })
+
+    return results
+
+query = "movement transfer activity"
+
+results = retrieve(query)
+
+print("\nQUERY:", query)
+
+for r in results:
+
+    print(r)
+
+print("\nDONE.")
