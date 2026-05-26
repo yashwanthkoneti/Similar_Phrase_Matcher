@@ -1,0 +1,649 @@
+"""
+CRUDE E2E MVP
+-------------
+Unsupervised Semantic Phrase Discovery for ECM Cases
+
+Single-script experimental pipeline.
+
+Pipeline:
+1. Load ECM cases
+2. Normalize text
+3. Generate sliding phrase windows
+4. Build weak positive/negative pairs
+5. Train Siamese phrase encoder
+6. Generate embeddings
+7. Cluster phrases
+8. Retrieve nearest semantic phrases
+9. Detect multi-theme patterns per case
+
+Dependencies:
+-------------
+pip install pandas numpy scikit-learn torch tqdm hdbscan faiss-cpu
+
+Run:
+----
+python semantic_phrase_discovery_e2e.py
+"""
+
+import re
+import random
+import pickle
+from collections import Counter, defaultdict
+from itertools import combinations
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from torch.utils.data import Dataset, DataLoader
+
+from sklearn.cluster import DBSCAN
+from sklearn.metrics.pairwise import cosine_similarity
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+SEED = 42
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+WINDOW_SIZES = [3, 4, 5, 6]
+MAX_LEN = 12
+
+MIN_FREQ = 2
+
+EMB_DIM = 128
+
+BATCH_SIZE = 256
+
+EPOCHS = 5
+
+LR = 1e-3
+
+MARGIN = 0.3
+
+TOPK = 10
+
+# ============================================================
+# SAMPLE ECM DATA
+# Replace this with real ECM data loading
+# ============================================================
+
+cases = [
+    {
+        "case_id": "C1",
+        "actions": "rapid movement of funds between multiple accounts",
+        "narrative": "high velocity transfer pattern observed",
+        "riskcode": "WIRE",
+        "statuscd": "OPEN",
+    },
+
+    {
+        "case_id": "C2",
+        "actions": "multiple outgoing wires from newly opened account",
+        "narrative": "rapid transfer activity detected",
+        "riskcode": "WIRE",
+        "statuscd": "OPEN",
+    },
+
+    {
+        "case_id": "C3",
+        "actions": "identity mismatch across documents",
+        "narrative": "synthetic identity behavior detected",
+        "riskcode": "KYC",
+        "statuscd": "OPEN",
+    },
+
+    {
+        "case_id": "C4",
+        "actions": "cash deposits followed by immediate withdrawals",
+        "narrative": "possible funnel account activity",
+        "riskcode": "CASH",
+        "statuscd": "OPEN",
+    },
+]
+
+df = pd.DataFrame(cases)
+
+# ============================================================
+# NORMALIZATION
+# ============================================================
+
+def normalize_text(text):
+
+    if pd.isna(text):
+        return ""
+
+    text = text.lower()
+
+    text = re.sub(r'\d+', ' NUM_TOKEN ', text)
+
+    text = re.sub(r'\b[a-z]*\d+[a-z\d]*\b', ' ID_TOKEN ', text)
+
+    text = re.sub(r'\s+', ' ', text)
+
+    return text.strip()
+
+def combine_case_text(row):
+
+    cols = [
+        "actions",
+        "narrative",
+        "riskcode",
+        "statuscd"
+    ]
+
+    text = " ".join([
+        str(row[c]) for c in cols
+        if c in row and pd.notna(row[c])
+    ])
+
+    return normalize_text(text)
+
+df["combined_text"] = df.apply(
+    combine_case_text,
+    axis=1
+)
+
+print("\n================ NORMALIZED CASES ================\n")
+print(df[["case_id", "combined_text"]])
+
+# ============================================================
+# VOCAB BUILDING
+# ============================================================
+
+counter = Counter()
+
+for text in df["combined_text"]:
+
+    counter.update(text.split())
+
+vocab = {
+    "<PAD>": 0,
+    "<UNK>": 1
+}
+
+idx = 2
+
+for token, freq in counter.items():
+
+    if freq >= MIN_FREQ:
+
+        vocab[token] = idx
+        idx += 1
+
+print("\nVOCAB SIZE:", len(vocab))
+
+# ============================================================
+# SLIDING WINDOW GENERATION
+# ============================================================
+
+all_phrases = []
+
+phrase_case_map = defaultdict(set)
+
+def generate_windows(tokens):
+
+    phrases = []
+
+    for w in WINDOW_SIZES:
+
+        for i in range(len(tokens)-w+1):
+
+            phrase = tokens[i:i+w]
+
+            phrases.append(" ".join(phrase))
+
+    return phrases
+
+for _, row in df.iterrows():
+
+    case_id = row["case_id"]
+
+    tokens = row["combined_text"].split()
+
+    phrases = generate_windows(tokens)
+
+    for phrase in phrases:
+
+        all_phrases.append({
+            "case_id": case_id,
+            "phrase": phrase
+        })
+
+        phrase_case_map[phrase].add(case_id)
+
+phrases_df = pd.DataFrame(all_phrases)
+
+print("\nTOTAL PHRASES:", len(phrases_df))
+
+# ============================================================
+# DEDUPLICATION
+# ============================================================
+
+phrase_freq = Counter(phrases_df["phrase"])
+
+unique_phrases = list(phrase_freq.keys())
+
+print("UNIQUE PHRASES:", len(unique_phrases))
+
+# ============================================================
+# WEAK PAIR GENERATION
+# ============================================================
+
+def jaccard(a, b):
+
+    a = set(a.split())
+    b = set(b.split())
+
+    return len(a & b) / len(a | b)
+
+positive_pairs = []
+
+negative_pairs = []
+
+# -------------------------
+# POSITIVE PAIRS
+# -------------------------
+
+for case_id in df["case_id"]:
+
+    case_phrases = phrases_df[
+        phrases_df["case_id"] == case_id
+    ]["phrase"].tolist()
+
+    for p1, p2 in combinations(case_phrases, 2):
+
+        sim = jaccard(p1, p2)
+
+        if sim >= 0.3:
+
+            positive_pairs.append((p1, p2, 1))
+
+# -------------------------
+# NEGATIVE PAIRS
+# -------------------------
+
+for _ in range(len(positive_pairs)):
+
+    p1 = random.choice(unique_phrases)
+    p2 = random.choice(unique_phrases)
+
+    if jaccard(p1, p2) < 0.1:
+
+        negative_pairs.append((p1, p2, 0))
+
+pairs = positive_pairs + negative_pairs
+
+random.shuffle(pairs)
+
+print("\nPOSITIVE PAIRS:", len(positive_pairs))
+print("NEGATIVE PAIRS:", len(negative_pairs))
+
+# ============================================================
+# DATASET
+# ============================================================
+
+class SiamesePhraseDataset(Dataset):
+
+    def __init__(self, pairs):
+
+        self.pairs = pairs
+
+    def encode(self, text):
+
+        ids = [
+            vocab.get(t, vocab["<UNK>"])
+            for t in text.split()
+        ]
+
+        ids = ids[:MAX_LEN]
+
+        while len(ids) < MAX_LEN:
+            ids.append(0)
+
+        return torch.tensor(ids)
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+
+        p1, p2, label = self.pairs[idx]
+
+        return {
+            "x1": self.encode(p1),
+            "x2": self.encode(p2),
+            "label": torch.tensor(label).float()
+        }
+
+dataset = SiamesePhraseDataset(pairs)
+
+loader = DataLoader(
+    dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True
+)
+
+# ============================================================
+# ENCODER
+# ============================================================
+
+class PhraseEncoder(nn.Module):
+
+    def __init__(self, vocab_size, emb_dim):
+
+        super().__init__()
+
+        self.embedding = nn.Embedding(
+            vocab_size,
+            emb_dim,
+            padding_idx=0
+        )
+
+    def forward(self, input_ids):
+
+        emb = self.embedding(input_ids)
+
+        mask = (input_ids != 0).float()
+
+        emb = emb * mask.unsqueeze(-1)
+
+        pooled = emb.sum(1) / (
+            mask.sum(1).unsqueeze(-1) + 1e-8
+        )
+
+        return F.normalize(pooled, p=2, dim=1)
+
+# ============================================================
+# SIAMESE MODEL
+# ============================================================
+
+class SiameseModel(nn.Module):
+
+    def __init__(self, encoder):
+
+        super().__init__()
+
+        self.encoder = encoder
+
+    def forward(self, x1, x2):
+
+        z1 = self.encoder(x1)
+        z2 = self.encoder(x2)
+
+        return z1, z2
+
+# ============================================================
+# LOSS
+# ============================================================
+
+class CosineContrastiveLoss(nn.Module):
+
+    def __init__(self, margin=0.3):
+
+        super().__init__()
+
+        self.margin = margin
+
+    def forward(self, z1, z2, labels):
+
+        cosine = F.cosine_similarity(z1, z2)
+
+        pos_loss = labels * (1 - cosine)
+
+        neg_loss = (1-labels) * F.relu(
+            cosine - self.margin
+        )
+
+        return (pos_loss + neg_loss).mean()
+
+# ============================================================
+# TRAINING
+# ============================================================
+
+encoder = PhraseEncoder(
+    vocab_size=len(vocab),
+    emb_dim=EMB_DIM
+)
+
+model = SiameseModel(encoder).to(DEVICE)
+
+criterion = CosineContrastiveLoss(
+    margin=MARGIN
+)
+
+optimizer = torch.optim.Adam(
+    model.parameters(),
+    lr=LR
+)
+
+print("\n================ TRAINING ================\n")
+
+for epoch in range(EPOCHS):
+
+    model.train()
+
+    total_loss = 0
+
+    for batch in loader:
+
+        x1 = batch["x1"].to(DEVICE)
+        x2 = batch["x2"].to(DEVICE)
+
+        y = batch["label"].to(DEVICE)
+
+        z1, z2 = model(x1, x2)
+
+        loss = criterion(z1, z2, y)
+
+        optimizer.zero_grad()
+
+        loss.backward()
+
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    print(f"Epoch {epoch+1} Loss: {total_loss:.4f}")
+
+# ============================================================
+# EMBEDDING GENERATION
+# ============================================================
+
+print("\n================ GENERATING EMBEDDINGS ================\n")
+
+def encode_phrase(text):
+
+    ids = [
+        vocab.get(t, vocab["<UNK>"])
+        for t in text.split()
+    ]
+
+    ids = ids[:MAX_LEN]
+
+    while len(ids) < MAX_LEN:
+        ids.append(0)
+
+    return torch.tensor(ids).unsqueeze(0)
+
+model.eval()
+
+phrase_embeddings = []
+
+with torch.no_grad():
+
+    for phrase in tqdm(unique_phrases):
+
+        ids = encode_phrase(phrase).to(DEVICE)
+
+        emb = model.encoder(ids)
+
+        phrase_embeddings.append(
+            emb.squeeze(0).cpu().numpy()
+        )
+
+phrase_embeddings = np.array(phrase_embeddings)
+
+print("EMBEDDING SHAPE:", phrase_embeddings.shape)
+
+# ============================================================
+# CLUSTERING
+# ============================================================
+
+print("\n================ CLUSTERING ================\n")
+
+clusterer = DBSCAN(
+    eps=0.25,
+    min_samples=2,
+    metric='cosine'
+)
+
+cluster_labels = clusterer.fit_predict(
+    phrase_embeddings
+)
+
+cluster_map = defaultdict(list)
+
+for phrase, label in zip(unique_phrases, cluster_labels):
+
+    cluster_map[label].append(phrase)
+
+# ============================================================
+# CLUSTER OUTPUT
+# ============================================================
+
+print("\n================ DISCOVERED THEMES ================\n")
+
+for cluster_id, phrases in cluster_map.items():
+
+    if cluster_id == -1:
+        continue
+
+    print(f"\nCLUSTER {cluster_id}")
+    print("-" * 50)
+
+    for p in phrases[:15]:
+        print(p)
+
+# ============================================================
+# PHRASE RETRIEVAL
+# ============================================================
+
+print("\n================ SEMANTIC RETRIEVAL ================\n")
+
+def retrieve_similar_phrases(query, topk=5):
+
+    model.eval()
+
+    with torch.no_grad():
+
+        ids = encode_phrase(query).to(DEVICE)
+
+        query_emb = model.encoder(ids)
+
+        query_emb = query_emb.cpu().numpy()
+
+    sims = cosine_similarity(
+        query_emb,
+        phrase_embeddings
+    )[0]
+
+    top_indices = sims.argsort()[-topk:][::-1]
+
+    results = []
+
+    for idx in top_indices:
+
+        results.append({
+            "phrase": unique_phrases[idx],
+            "score": round(float(sims[idx]), 4)
+        })
+
+    return results
+
+query = "rapid movement funds"
+
+results = retrieve_similar_phrases(query)
+
+print("\nQUERY:", query)
+
+for r in results:
+    print(r)
+
+# ============================================================
+# MULTI-THEME DETECTION
+# ============================================================
+
+print("\n================ CASE MULTI-THEME DETECTION ================\n")
+
+phrase_to_cluster = {
+    p: c
+    for p, c in zip(unique_phrases, cluster_labels)
+}
+
+for _, row in df.iterrows():
+
+    case_id = row["case_id"]
+
+    tokens = row["combined_text"].split()
+
+    phrases = generate_windows(tokens)
+
+    case_clusters = []
+
+    for phrase in phrases:
+
+        if phrase in phrase_to_cluster:
+
+            c = phrase_to_cluster[phrase]
+
+            if c != -1:
+                case_clusters.append(c)
+
+    cluster_counts = Counter(case_clusters)
+
+    print(f"\nCASE: {case_id}")
+
+    print("THEMES:")
+
+    for cluster_id, count in cluster_counts.items():
+
+        print(
+            f"Cluster {cluster_id} -> "
+            f"{count} phrases"
+        )
+
+# ============================================================
+# SAVE ARTIFACTS
+# ============================================================
+
+print("\n================ SAVING ARTIFACTS ================\n")
+
+torch.save(
+    model.state_dict(),
+    "phrase_encoder.pt"
+)
+
+np.save(
+    "phrase_embeddings.npy",
+    phrase_embeddings
+)
+
+with open("vocab.pkl", "wb") as f:
+    pickle.dump(vocab, f)
+
+phrases_df.to_parquet(
+    "phrases.parquet"
+)
+
+print("DONE.")
